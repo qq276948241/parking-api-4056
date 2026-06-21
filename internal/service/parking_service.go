@@ -141,13 +141,20 @@ func (s *ParkingService) PreviewFee(p CalcFeeParams) (*PreviewFeeResult, error) 
 		exitTime = time.Now()
 	}
 
+	card, _ := s.MonthlyCardSvc.CheckVehicleActiveCard(record.ParkingLotID, record.VehiclePlate)
+	isMonthly := card != nil
+	if isMonthly {
+		record.IsMonthly = true
+		record.MonthlyCardID = &card.ID
+	}
+
 	var lot models.ParkingLot
 	utils.DB.First(&lot, record.ParkingLotID)
 	cfg := s.FeeService.BuildConfig(&lot)
 	fee := s.FeeService.CalcFee(record.EntryTime, exitTime, cfg)
 
 	totalAmount := fee.FinalAmount
-	if record.IsMonthly {
+	if isMonthly {
 		totalAmount = 0
 	}
 
@@ -155,7 +162,7 @@ func (s *ParkingService) PreviewFee(p CalcFeeParams) (*PreviewFeeResult, error) 
 		Record:      &record,
 		ExitTime:    exitTime,
 		Fee:         fee,
-		IsMonthly:   record.IsMonthly,
+		IsMonthly:   isMonthly,
 		TotalAmount: totalAmount,
 	}, nil
 }
@@ -196,13 +203,20 @@ func (s *ParkingService) VehicleExit(p ExitParams) (*ExitResult, error) {
 		exitTime = time.Now()
 	}
 
+	card, _ := s.MonthlyCardSvc.CheckVehicleActiveCard(record.ParkingLotID, record.VehiclePlate)
+	isMonthly := card != nil
+	if isMonthly {
+		record.IsMonthly = true
+		record.MonthlyCardID = &card.ID
+	}
+
 	var lot models.ParkingLot
 	utils.DB.First(&lot, record.ParkingLotID)
 	cfg := s.FeeService.BuildConfig(&lot)
 	fee := s.FeeService.CalcFee(record.EntryTime, exitTime, cfg)
 
 	totalAmount := fee.FinalAmount
-	if record.IsMonthly {
+	if isMonthly {
 		totalAmount = 0
 	}
 	discount := p.Discount
@@ -227,7 +241,7 @@ func (s *ParkingService) VehicleExit(p ExitParams) (*ExitResult, error) {
 	}
 
 	paymentMethod := p.PaymentMethod
-	if record.IsMonthly {
+	if isMonthly {
 		payStatus = "paid"
 		paidAmount = 0
 		paymentMethod = "monthly"
