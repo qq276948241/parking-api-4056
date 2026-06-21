@@ -243,6 +243,7 @@ func (h *ParkingRecordHandler) CalcFee(c *gin.Context) {
 		HourlyRate:  lot.HourlyRate,
 		DailyMax:    lot.DailyMax,
 		FreeMinutes: lot.FreeMinutes,
+		FeeTiers:    lot.FeeTiers,
 	})
 
 	utils.OK(c, gin.H{
@@ -256,6 +257,8 @@ func (h *ParkingRecordHandler) CalcFee(c *gin.Context) {
 		"hourly_rate":     lot.HourlyRate,
 		"daily_max":       lot.DailyMax,
 		"free_minutes":    lot.FreeMinutes,
+		"fee_tiers":       lot.FeeTiers,
+		"breakdown":       fee.Breakdown,
 		"base_amount":     fee.BaseAmount,
 		"final_amount":    fee.FinalAmount,
 		"is_monthly":      record.IsMonthly,
@@ -301,6 +304,7 @@ func (h *ParkingRecordHandler) Exit(c *gin.Context) {
 		HourlyRate:  lot.HourlyRate,
 		DailyMax:    lot.DailyMax,
 		FreeMinutes: lot.FreeMinutes,
+		FeeTiers:    lot.FeeTiers,
 	})
 
 	totalAmount := fee.FinalAmount
@@ -380,6 +384,7 @@ func (h *ParkingRecordHandler) Exit(c *gin.Context) {
 		"record":          record,
 		"duration_min":    fee.DurationMin,
 		"chargeable_min":  fee.ChargeableMin,
+		"breakdown":       fee.Breakdown,
 		"base_amount":     fee.BaseAmount,
 		"total_amount":    totalAmount,
 		"discount":        discount,

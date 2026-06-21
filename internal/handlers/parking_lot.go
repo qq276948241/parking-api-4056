@@ -17,25 +17,27 @@ func NewParkingLotHandler() *ParkingLotHandler {
 }
 
 type LotCreateReq struct {
-	Name         string  `json:"name" binding:"required"`
-	Address      string  `json:"address"`
-	ContactPhone string  `json:"contact_phone"`
-	TotalSpaces  int     `json:"total_spaces" binding:"required,min=1"`
-	HourlyRate   float64 `json:"hourly_rate" binding:"required,min=0"`
-	DailyMax     float64 `json:"daily_max" binding:"min=0"`
-	FreeMinutes  int     `json:"free_minutes" binding:"min=0"`
-	IsActive     *bool   `json:"is_active"`
+	Name         string          `json:"name" binding:"required"`
+	Address      string          `json:"address"`
+	ContactPhone string          `json:"contact_phone"`
+	TotalSpaces  int             `json:"total_spaces" binding:"required,min=1"`
+	HourlyRate   float64         `json:"hourly_rate" binding:"required,min=0"`
+	DailyMax     float64         `json:"daily_max" binding:"min=0"`
+	FreeMinutes  int             `json:"free_minutes" binding:"min=0"`
+	FeeTiers     models.FeeTiers `json:"fee_tiers"`
+	IsActive     *bool           `json:"is_active"`
 }
 
 type LotUpdateReq struct {
-	Name         string   `json:"name"`
-	Address      string   `json:"address"`
-	ContactPhone string   `json:"contact_phone"`
-	TotalSpaces  *int     `json:"total_spaces" binding:"omitempty,min=1"`
-	HourlyRate   *float64 `json:"hourly_rate" binding:"omitempty,min=0"`
-	DailyMax     *float64 `json:"daily_max" binding:"omitempty,min=0"`
-	FreeMinutes  *int     `json:"free_minutes" binding:"omitempty,min=0"`
-	IsActive     *bool    `json:"is_active"`
+	Name         string          `json:"name"`
+	Address      string          `json:"address"`
+	ContactPhone string          `json:"contact_phone"`
+	TotalSpaces  *int            `json:"total_spaces" binding:"omitempty,min=1"`
+	HourlyRate   *float64        `json:"hourly_rate" binding:"omitempty,min=0"`
+	DailyMax     *float64        `json:"daily_max" binding:"omitempty,min=0"`
+	FreeMinutes  *int            `json:"free_minutes" binding:"omitempty,min=0"`
+	FeeTiers     models.FeeTiers `json:"fee_tiers"`
+	IsActive     *bool           `json:"is_active"`
 }
 
 func (h *ParkingLotHandler) List(c *gin.Context) {
@@ -90,6 +92,7 @@ func (h *ParkingLotHandler) Create(c *gin.Context) {
 		HourlyRate:   req.HourlyRate,
 		DailyMax:     req.DailyMax,
 		FreeMinutes:  req.FreeMinutes,
+		FeeTiers:     req.FeeTiers,
 		IsActive:     true,
 	}
 	if req.IsActive != nil {
@@ -166,6 +169,9 @@ func (h *ParkingLotHandler) Update(c *gin.Context) {
 	}
 	if req.FreeMinutes != nil {
 		lot.FreeMinutes = *req.FreeMinutes
+	}
+	if len(req.FeeTiers) > 0 {
+		lot.FeeTiers = req.FeeTiers
 	}
 	if req.IsActive != nil {
 		lot.IsActive = *req.IsActive

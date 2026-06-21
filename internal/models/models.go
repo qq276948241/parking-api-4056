@@ -1,11 +1,55 @@
 package models
 
 import (
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+type FeeTier struct {
+	StartHour float64 `json:"start_hour"`
+	EndHour   float64 `json:"end_hour"`
+	Rate      float64 `json:"rate"`
+}
+
+type FeeTiers []FeeTier
+
+func (ft FeeTiers) Value() (driver.Value, error) {
+	if ft == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(ft)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
+func (ft *FeeTiers) Scan(value interface{}) error {
+	if value == nil {
+		*ft = nil
+		return nil
+	}
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return errors.New("fee_tiers scan: invalid type")
+	}
+	var parsed FeeTiers
+	if err := json.Unmarshal(bytes, &parsed); err != nil {
+		return err
+	}
+	*ft = parsed
+	return nil
+}
 
 type Base struct {
 	ID        uuid.UUID      `gorm:"type:uuid;primaryKey" json:"id"`
@@ -42,6 +86,7 @@ type ParkingLot struct {
 	HourlyRate   float64   `gorm:"type:decimal(10,2);not null;default:5.00" json:"hourly_rate"`
 	DailyMax     float64   `gorm:"type:decimal(10,2);not null;default:50.00" json:"daily_max"`
 	FreeMinutes  int       `gorm:"not null;default:30" json:"free_minutes"`
+	FeeTiers     FeeTiers  `gorm:"type:jsonb" json:"fee_tiers"`
 	IsActive     bool      `gorm:"not null;default:true" json:"is_active"`
 }
 

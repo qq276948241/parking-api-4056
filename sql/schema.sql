@@ -33,10 +33,13 @@ CREATE TABLE IF NOT EXISTS parking_lots (
     hourly_rate DECIMAL(10,2) NOT NULL DEFAULT 5.00,
     daily_max DECIMAL(10,2) NOT NULL DEFAULT 50.00,
     free_minutes INT NOT NULL DEFAULT 30,
+    fee_tiers JSONB,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE parking_lots ADD COLUMN IF NOT EXISTS fee_tiers JSONB;
 
 -- ========================================
 -- 3. 车位表
