@@ -3,6 +3,7 @@ package handlers
 import (
 	"parking-system/internal/middleware"
 	"parking-system/internal/models"
+	"parking-system/internal/service"
 	"parking-system/internal/utils"
 	"strconv"
 	"time"
@@ -11,10 +12,12 @@ import (
 	"github.com/google/uuid"
 )
 
-type ParkingRecordHandler struct{}
+type ParkingRecordHandler struct {
+	svc *service.ParkingService
+}
 
 func NewParkingRecordHandler() *ParkingRecordHandler {
-	return &ParkingRecordHandler{}
+	return &ParkingRecordHandler{svc: service.NewParkingService()}
 }
 
 type EntryReq struct {
@@ -33,12 +36,6 @@ type ExitReq struct {
 	PaymentStatus  string  `json:"payment_status" binding:"omitempty,oneof=unpaid paid partial waived"`
 	TransactionNo  string  `json:"transaction_no"`
 	Remarks        string  `json:"remarks"`
-}
-
-type CalcFeeReq struct {
-	RecordID     string `json:"record_id"`
-	VehiclePlate string `json:"vehicle_plate"`
-	ExitTime     string `json:"exit_time"`
 }
 
 func (h *ParkingRecordHandler) List(c *gin.Context) {
@@ -121,26 +118,6 @@ func (h *ParkingRecordHandler) Entry(c *gin.Context) {
 		utils.BadRequest(c, "参数错误: "+err.Error())
 		return
 	}
-	req.ParkingLotID = lotID.String()
-
-	var existing models.ParkingRecord
-	utils.DB.Where("parking_lot_id = ? AND vehicle_plate = ? AND status = ?", lotID, req.VehiclePlate, "parking").
-		First(&existing)
-	if existing.ID != uuid.Nil {
-		utils.BadRequest(c, "该车辆已在场内")
-		return
-	}
-
-	var lot models.ParkingLot
-	utils.DB.First(&lot, lotID)
-
-	var card models.MonthlyCard
-	var isMonthly bool
-	utils.DB.Where("parking_lot_id = ? AND vehicle_plate = ? AND status = ? AND start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE",
-		lotID, req.VehiclePlate, "active").Order("end_date DESC").First(&card)
-	if card.ID != uuid.Nil {
-		isMonthly = true
-	}
 
 	entryTime := time.Now()
 	if req.EntryTime != "" {
@@ -148,37 +125,25 @@ func (h *ParkingRecordHandler) Entry(c *gin.Context) {
 			entryTime = t
 		}
 	}
-
-	record := models.ParkingRecord{
-		ParkingLotID: lotID,
-		VehiclePlate: req.VehiclePlate,
-		VehicleType:  "car",
-		EntryTime:    entryTime,
-		HourlyRate:   lot.HourlyRate,
-		Status:       "parking",
-		IsMonthly:    isMonthly,
-	}
-	if req.VehicleType != "" {
-		record.VehicleType = req.VehicleType
-	}
+	var spaceID *uuid.UUID
 	if req.SpaceID != "" {
 		if sid, err := uuid.Parse(req.SpaceID); err == nil {
-			record.SpaceID = &sid
-			utils.DB.Model(&models.ParkingSpace{}).Where("id = ?", sid).
-				Updates(map[string]interface{}{"status": "occupied", "vehicle_plate": req.VehiclePlate})
+			spaceID = &sid
 		}
 	}
-	if isMonthly {
-		record.MonthlyCardID = &card.ID
-		record.PaymentStatus = "paid"
-		record.PaymentMethod = "monthly"
-	}
 
-	if err := utils.DB.Create(&record).Error; err != nil {
-		utils.InternalError(c, "入场登记失败")
+	res, err := h.svc.VehicleEntry(service.EntryParams{
+		ParkingLotID: lotID,
+		SpaceID:      spaceID,
+		VehiclePlate: req.VehiclePlate,
+		VehicleType:  req.VehicleType,
+		EntryTime:    entryTime,
+	})
+	if err != nil {
+		utils.BadRequest(c, err.Error())
 		return
 	}
-	utils.OK(c, record)
+	utils.OK(c, res.Record)
 }
 
 func (h *ParkingRecordHandler) Get(c *gin.Context) {
@@ -187,8 +152,8 @@ func (h *ParkingRecordHandler) Get(c *gin.Context) {
 		utils.BadRequest(c, "ID格式错误")
 		return
 	}
-	var record models.ParkingRecord
-	if err := utils.DB.First(&record, id).Error; err != nil {
+	record, err := h.svc.GetRecord(id)
+	if err != nil {
 		utils.NotFound(c, "记录不存在")
 		return
 	}
@@ -200,33 +165,23 @@ func (h *ParkingRecordHandler) Get(c *gin.Context) {
 }
 
 func (h *ParkingRecordHandler) CalcFee(c *gin.Context) {
-	var record models.ParkingRecord
+	var recordID *uuid.UUID
 	if idStr := c.Query("record_id"); idStr != "" {
 		id, err := uuid.Parse(idStr)
 		if err != nil {
 			utils.BadRequest(c, "记录ID格式错误")
 			return
 		}
-		if err := utils.DB.First(&record, id).Error; err != nil {
+		rec, err := h.svc.GetRecord(id)
+		if err != nil {
 			utils.NotFound(c, "记录不存在")
 			return
 		}
-		if err := checkLotAccess(c, record.ParkingLotID); err != nil {
+		if err := checkLotAccess(c, rec.ParkingLotID); err != nil {
 			utils.Forbidden(c, err.Error())
 			return
 		}
-	} else {
-		plate := c.Query("vehicle_plate")
-		lotID, ok := getTargetLotID(c)
-		if !ok {
-			return
-		}
-		utils.DB.Where("parking_lot_id = ? AND vehicle_plate = ? AND status = ?", lotID, plate, "parking").
-			Order("entry_time DESC").First(&record)
-		if record.ID == uuid.Nil {
-			utils.NotFound(c, "未找到该车辆在场记录")
-			return
-		}
+		recordID = &id
 	}
 
 	exitTime := time.Now()
@@ -236,33 +191,49 @@ func (h *ParkingRecordHandler) CalcFee(c *gin.Context) {
 		}
 	}
 
-	var lot models.ParkingLot
-	utils.DB.First(&lot, record.ParkingLotID)
+	var lotID *uuid.UUID
+	var plate string
+	if recordID == nil {
+		plate = c.Query("vehicle_plate")
+		lid, ok := getTargetLotID(c)
+		if !ok {
+			return
+		}
+		lotID = &lid
+	}
 
-	fee := utils.CalcParkingFee(record.EntryTime, exitTime, utils.ParkingFeeCalc{
-		HourlyRate:  lot.HourlyRate,
-		DailyMax:    lot.DailyMax,
-		FreeMinutes: lot.FreeMinutes,
-		FeeTiers:    lot.FeeTiers,
+	preview, err := h.svc.PreviewFee(service.CalcFeeParams{
+		RecordID: recordID,
+		Plate:    plate,
+		LotID:    lotID,
+		ExitTime: exitTime,
 	})
+	if err != nil {
+		utils.NotFound(c, err.Error())
+		return
+	}
+	if err := checkLotAccess(c, preview.Record.ParkingLotID); err != nil {
+		utils.Forbidden(c, err.Error())
+		return
+	}
 
 	utils.OK(c, gin.H{
-		"record_id":       record.ID,
-		"vehicle_plate":   record.VehiclePlate,
-		"entry_time":      record.EntryTime,
-		"exit_time":       exitTime,
-		"duration_min":    fee.DurationMin,
-		"chargeable_min":  fee.ChargeableMin,
-		"hours":           fee.Hours,
-		"hourly_rate":     lot.HourlyRate,
-		"daily_max":       lot.DailyMax,
-		"free_minutes":    lot.FreeMinutes,
-		"fee_tiers":       lot.FeeTiers,
-		"breakdown":       fee.Breakdown,
-		"base_amount":     fee.BaseAmount,
-		"final_amount":    fee.FinalAmount,
-		"is_monthly":      record.IsMonthly,
-		"monthly_card_id": record.MonthlyCardID,
+		"record_id":       preview.Record.ID,
+		"vehicle_plate":   preview.Record.VehiclePlate,
+		"entry_time":      preview.Record.EntryTime,
+		"exit_time":       preview.ExitTime,
+		"duration_min":    preview.Fee.DurationMin,
+		"chargeable_min":  preview.Fee.ChargeableMin,
+		"hours":           preview.Fee.Hours,
+		"hourly_rate":     preview.Fee.Config.HourlyRate,
+		"daily_max":       preview.Fee.Config.DailyMax,
+		"free_minutes":    preview.Fee.Config.FreeMinutes,
+		"fee_tiers":       preview.Fee.Config.FeeTiers,
+		"breakdown":       preview.Fee.Breakdown,
+		"base_amount":     preview.Fee.BaseAmount,
+		"final_amount":    preview.TotalAmount,
+		"is_monthly":      preview.IsMonthly,
+		"monthly_card_id": preview.Record.MonthlyCardID,
 	})
 }
 
@@ -272,24 +243,22 @@ func (h *ParkingRecordHandler) Exit(c *gin.Context) {
 		utils.BadRequest(c, "ID格式错误")
 		return
 	}
-	var record models.ParkingRecord
-	if err := utils.DB.First(&record, id).Error; err != nil {
+	rec, err := h.svc.GetRecord(id)
+	if err != nil {
 		utils.NotFound(c, "记录不存在")
 		return
 	}
-	if err := checkLotAccess(c, record.ParkingLotID); err != nil {
+	if err := checkLotAccess(c, rec.ParkingLotID); err != nil {
 		utils.Forbidden(c, err.Error())
 		return
 	}
-	if record.Status == "completed" {
-		utils.BadRequest(c, "该记录已出场")
-		return
-	}
+
 	var req ExitReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.BadRequest(c, "参数错误: "+err.Error())
 		return
 	}
+
 	exitTime := time.Now()
 	if req.ExitTime != "" {
 		if t, err := time.ParseInLocation("2006-01-02 15:04:05", req.ExitTime, time.Local); err == nil {
@@ -297,99 +266,32 @@ func (h *ParkingRecordHandler) Exit(c *gin.Context) {
 		}
 	}
 
-	var lot models.ParkingLot
-	utils.DB.First(&lot, record.ParkingLotID)
-
-	fee := utils.CalcParkingFee(record.EntryTime, exitTime, utils.ParkingFeeCalc{
-		HourlyRate:  lot.HourlyRate,
-		DailyMax:    lot.DailyMax,
-		FreeMinutes: lot.FreeMinutes,
-		FeeTiers:    lot.FeeTiers,
+	res, err := h.svc.VehicleExit(service.ExitParams{
+		RecordID:      id,
+		ExitTime:      exitTime,
+		PaymentMethod: req.PaymentMethod,
+		Discount:      req.Discount,
+		PaidAmount:    req.PaidAmount,
+		PaymentStatus: req.PaymentStatus,
+		TransactionNo: req.TransactionNo,
+		OperatorID:    middleware.GetAdminID(c),
+		Remarks:       req.Remarks,
 	})
-
-	totalAmount := fee.FinalAmount
-	if record.IsMonthly {
-		totalAmount = 0
-	}
-	discount := req.Discount
-	if discount < 0 {
-		discount = 0
-	}
-	finalAmount := totalAmount - discount
-	if finalAmount < 0 {
-		finalAmount = 0
-	}
-
-	paidAmount := req.PaidAmount
-	payStatus := req.PaymentStatus
-	if payStatus == "" {
-		if paidAmount >= finalAmount {
-			payStatus = "paid"
-		} else if paidAmount > 0 {
-			payStatus = "partial"
-		} else {
-			payStatus = "unpaid"
-		}
-	}
-	if record.IsMonthly {
-		payStatus = "paid"
-		paidAmount = 0
-	}
-
-	paymentMethod := req.PaymentMethod
-	if record.IsMonthly {
-		paymentMethod = "monthly"
-	}
-
-	record.ExitTime = &exitTime
-	record.DurationMin = fee.DurationMin
-	record.TotalAmount = totalAmount
-	record.Discount = discount
-	record.PaidAmount = paidAmount
-	record.PaymentStatus = payStatus
-	record.PaymentMethod = paymentMethod
-	record.Status = "completed"
-	record.Remarks = req.Remarks
-
-	tx := utils.DB.Begin()
-	if err := tx.Save(&record).Error; err != nil {
-		tx.Rollback()
-		utils.InternalError(c, "出场登记失败")
+	if err != nil {
+		utils.BadRequest(c, err.Error())
 		return
 	}
 
-	if record.SpaceID != nil {
-		tx.Model(&models.ParkingSpace{}).Where("id = ?", *record.SpaceID).
-			Updates(map[string]interface{}{"status": "available", "vehicle_plate": ""})
-	}
-
-	if paidAmount > 0 {
-		opID := middleware.GetAdminID(c)
-		payment := models.PaymentRecord{
-			ParkingLotID:    record.ParkingLotID,
-			ParkingRecordID: &record.ID,
-			PaymentType:     "parking",
-			Amount:          paidAmount,
-			PaymentMethod:   paymentMethod,
-			TransactionNo:   req.TransactionNo,
-			OperatorID:      &opID,
-			Status:          "success",
-		}
-		tx.Create(&payment)
-	}
-
-	tx.Commit()
-
 	utils.OK(c, gin.H{
-		"record":          record,
-		"duration_min":    fee.DurationMin,
-		"chargeable_min":  fee.ChargeableMin,
-		"breakdown":       fee.Breakdown,
-		"base_amount":     fee.BaseAmount,
-		"total_amount":    totalAmount,
-		"discount":        discount,
-		"final_amount":    finalAmount,
-		"paid_amount":     paidAmount,
+		"record":          res.Record,
+		"duration_min":    res.Fee.DurationMin,
+		"chargeable_min":  res.Fee.ChargeableMin,
+		"breakdown":       res.Fee.Breakdown,
+		"base_amount":     res.Fee.BaseAmount,
+		"total_amount":    res.TotalAmount,
+		"discount":        res.Discount,
+		"final_amount":    res.FinalAmount,
+		"paid_amount":     res.PaidAmount,
 	})
 }
 
@@ -399,19 +301,16 @@ func (h *ParkingRecordHandler) Pay(c *gin.Context) {
 		utils.BadRequest(c, "ID格式错误")
 		return
 	}
-	var record models.ParkingRecord
-	if err := utils.DB.First(&record, id).Error; err != nil {
+	rec, err := h.svc.GetRecord(id)
+	if err != nil {
 		utils.NotFound(c, "记录不存在")
 		return
 	}
-	if err := checkLotAccess(c, record.ParkingLotID); err != nil {
+	if err := checkLotAccess(c, rec.ParkingLotID); err != nil {
 		utils.Forbidden(c, err.Error())
 		return
 	}
-	if record.Status != "completed" {
-		utils.BadRequest(c, "车辆尚未出场，不能单独缴费")
-		return
-	}
+
 	type PayReq struct {
 		Amount        float64 `json:"amount" binding:"required,min=0"`
 		PaymentMethod string  `json:"payment_method" binding:"required,oneof=cash wechat alipay card"`
@@ -423,41 +322,18 @@ func (h *ParkingRecordHandler) Pay(c *gin.Context) {
 		return
 	}
 
-	remain := record.TotalAmount - record.Discount - record.PaidAmount
-	if remain <= 0 {
-		utils.BadRequest(c, "该记录已无待缴费用")
+	res, err := h.svc.PayRecord(service.PayParams{
+		RecordID:      id,
+		Amount:        req.Amount,
+		PaymentMethod: req.PaymentMethod,
+		TransactionNo: req.TransactionNo,
+		OperatorID:    middleware.GetAdminID(c),
+	})
+	if err != nil {
+		utils.BadRequest(c, err.Error())
 		return
 	}
-	paid := req.Amount
-	if paid > remain {
-		paid = remain
-	}
-
-	tx := utils.DB.Begin()
-	record.PaidAmount += paid
-	if record.PaidAmount >= (record.TotalAmount - record.Discount) {
-		record.PaymentStatus = "paid"
-		record.PaymentMethod = req.PaymentMethod
-	} else {
-		record.PaymentStatus = "partial"
-	}
-	tx.Save(&record)
-
-	opID := middleware.GetAdminID(c)
-	payment := models.PaymentRecord{
-		ParkingLotID:    record.ParkingLotID,
-		ParkingRecordID: &record.ID,
-		PaymentType:     "parking",
-		Amount:          paid,
-		PaymentMethod:   req.PaymentMethod,
-		TransactionNo:   req.TransactionNo,
-		OperatorID:      &opID,
-		Status:          "success",
-	}
-	tx.Create(&payment)
-	tx.Commit()
-
-	utils.OK(c, record)
+	utils.OK(c, res.Record)
 }
 
 func (h *ParkingRecordHandler) Update(c *gin.Context) {

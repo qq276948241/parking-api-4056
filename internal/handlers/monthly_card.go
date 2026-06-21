@@ -1,9 +1,9 @@
 package handlers
 
 import (
-	"fmt"
 	"parking-system/internal/middleware"
 	"parking-system/internal/models"
+	"parking-system/internal/service"
 	"parking-system/internal/utils"
 	"strconv"
 	"time"
@@ -12,10 +12,17 @@ import (
 	"github.com/google/uuid"
 )
 
-type MonthlyCardHandler struct{}
+type MonthlyCardHandler struct {
+	OpsSvc  *service.MonthlyCardOpsService
+	CardSvc *service.MonthlyCardService
+}
 
 func NewMonthlyCardHandler() *MonthlyCardHandler {
-	return &MonthlyCardHandler{}
+	ops := service.NewMonthlyCardOpsService()
+	return &MonthlyCardHandler{
+		OpsSvc:  ops,
+		CardSvc: ops.CardSvc,
+	}
 }
 
 type CardCreateReq struct {
@@ -37,19 +44,19 @@ type CardCreateReq struct {
 }
 
 type CardUpdateReq struct {
-	CardNumber    string  `json:"card_number"`
-	VehiclePlate  string  `json:"vehicle_plate"`
-	OwnerName     string  `json:"owner_name"`
-	OwnerPhone    string  `json:"owner_phone"`
-	PlanName      string  `json:"plan_name"`
-	PlanType      string  `json:"plan_type" binding:"omitempty,oneof=monthly quarterly yearly"`
+	CardNumber    string   `json:"card_number"`
+	VehiclePlate  string   `json:"vehicle_plate"`
+	OwnerName     string   `json:"owner_name"`
+	OwnerPhone    string   `json:"owner_phone"`
+	PlanName      string   `json:"plan_name"`
+	PlanType      string   `json:"plan_type" binding:"omitempty,oneof=monthly quarterly yearly"`
 	Price         *float64 `json:"price" binding:"omitempty,min=0"`
-	StartDate     *string `json:"start_date"`
-	EndDate       *string `json:"end_date"`
-	Status        string  `json:"status" binding:"omitempty,oneof=active expired suspended"`
+	StartDate     *string  `json:"start_date"`
+	EndDate       *string  `json:"end_date"`
+	Status        string   `json:"status" binding:"omitempty,oneof=active expired suspended"`
 	PaidAmount    *float64 `json:"paid_amount" binding:"omitempty,min=0"`
-	PaymentMethod string  `json:"payment_method" binding:"omitempty,oneof=cash wechat alipay card"`
-	Remarks       string  `json:"remarks"`
+	PaymentMethod string   `json:"payment_method" binding:"omitempty,oneof=cash wechat alipay card"`
+	Remarks       string   `json:"remarks"`
 }
 
 type CardRenewReq struct {
@@ -125,40 +132,20 @@ func (h *MonthlyCardHandler) Create(c *gin.Context) {
 		return
 	}
 
-	var endDate time.Time
+	var endDatePtr *time.Time
 	if req.EndDate != "" {
-		endDate, err = time.ParseInLocation("2006-01-02", req.EndDate, time.Local)
+		endDate, err := time.ParseInLocation("2006-01-02", req.EndDate, time.Local)
 		if err != nil {
 			utils.BadRequest(c, "结束日期格式错误，应为YYYY-MM-DD")
 			return
 		}
-	} else {
-		months := req.Months
-		if months <= 0 {
-			switch req.PlanType {
-			case "monthly":
-				months = 1
-			case "quarterly":
-				months = 3
-			case "yearly":
-				months = 12
-			}
-		}
-		endDate = startDate.AddDate(0, months, -1)
-	}
-	if endDate.Before(startDate) {
-		utils.BadRequest(c, "结束日期不能早于开始日期")
-		return
+		endDatePtr = &endDate
 	}
 
-	cardNumber := req.CardNumber
-	if cardNumber == "" {
-		cardNumber = fmt.Sprintf("MC%s%s", lotID.String()[:8], time.Now().Format("20060102150405"))
-	}
-
-	card := models.MonthlyCard{
+	opID := middleware.GetAdminID(c)
+	result, err := h.OpsSvc.CreateCard(service.CreateCardParams{
 		ParkingLotID:  lotID,
-		CardNumber:    cardNumber,
+		CardNumber:    req.CardNumber,
 		VehiclePlate:  req.VehiclePlate,
 		OwnerName:     req.OwnerName,
 		OwnerPhone:    req.OwnerPhone,
@@ -166,39 +153,24 @@ func (h *MonthlyCardHandler) Create(c *gin.Context) {
 		PlanType:      req.PlanType,
 		Price:         req.Price,
 		StartDate:     startDate,
-		EndDate:       endDate,
-		Status:        "active",
+		Months:        req.Months,
+		EndDate:       endDatePtr,
 		PaidAmount:    req.PaidAmount,
 		PaymentMethod: req.PaymentMethod,
+		TransactionNo: req.TransactionNo,
+		OperatorID:    opID,
 		Remarks:       req.Remarks,
-	}
-	if endDate.Before(time.Now()) {
-		card.Status = "expired"
-	}
-
-	tx := utils.DB.Begin()
-	if err := tx.Create(&card).Error; err != nil {
-		tx.Rollback()
-		utils.InternalError(c, "创建月卡失败，卡号可能已存在")
+	})
+	if err != nil {
+		if err == service.ErrInvalidDateRange {
+			utils.BadRequest(c, err.Error())
+		} else {
+			utils.InternalError(c, "创建月卡失败，卡号可能已存在")
+		}
 		return
 	}
-	if req.PaidAmount > 0 {
-		opID := middleware.GetAdminID(c)
-		payment := models.PaymentRecord{
-			ParkingLotID:  lotID,
-			MonthlyCardID: &card.ID,
-			PaymentType:   "monthly",
-			Amount:        req.PaidAmount,
-			PaymentMethod: req.PaymentMethod,
-			TransactionNo: req.TransactionNo,
-			OperatorID:    &opID,
-			Status:        "success",
-		}
-		tx.Create(&payment)
-	}
-	tx.Commit()
 
-	utils.OK(c, card)
+	utils.OK(c, result.Card)
 }
 
 func (h *MonthlyCardHandler) Get(c *gin.Context) {
@@ -217,13 +189,23 @@ func (h *MonthlyCardHandler) Get(c *gin.Context) {
 		return
 	}
 
-	var records []models.ParkingRecord
-	utils.DB.Where("monthly_card_id = ?", card.ID).Order("entry_time DESC").Limit(20).Find(&records)
+	cardPtr, records, validity, err := h.OpsSvc.GetCardWithRecords(id)
+	if err != nil {
+		if err == service.ErrCardNotFound {
+			utils.NotFound(c, "月卡不存在")
+		} else {
+			utils.InternalError(c, "查询失败")
+		}
+		return
+	}
 
 	utils.OK(c, gin.H{
-		"card":            card,
-		"remaining_days":  int(time.Until(card.EndDate).Hours() / 24),
-		"recent_records":  records,
+		"card":           cardPtr,
+		"is_active":      validity.Valid,
+		"remaining_days": validity.RemainingDays,
+		"remaining_hours": validity.RemainingHours,
+		"valid_reason":   validity.Reason,
+		"recent_records": records,
 	})
 }
 
@@ -320,45 +302,31 @@ func (h *MonthlyCardHandler) Renew(c *gin.Context) {
 		utils.BadRequest(c, "参数错误: "+err.Error())
 		return
 	}
-	var newStart, newEnd time.Time
-	if req.StartFromNow || card.EndDate.Before(time.Now()) {
-		newStart = time.Now()
-	} else {
-		newStart = card.EndDate.AddDate(0, 0, 1)
-	}
-	newEnd = newStart.AddDate(0, req.Months, -1)
 
-	card.PlanType = req.PlanType
-	card.Price = req.Price
-	card.StartDate = newStart
-	card.EndDate = newEnd
-	card.Status = "active"
-	card.PaidAmount += req.PaidAmount
-	if req.PaymentMethod != "" {
-		card.PaymentMethod = req.PaymentMethod
-	}
-
-	tx := utils.DB.Begin()
-	if err := tx.Save(&card).Error; err != nil {
-		tx.Rollback()
-		utils.InternalError(c, "续费失败")
-		return
-	}
 	opID := middleware.GetAdminID(c)
-	payment := models.PaymentRecord{
-		ParkingLotID:  card.ParkingLotID,
-		MonthlyCardID: &card.ID,
-		PaymentType:   "monthly",
-		Amount:        req.PaidAmount,
+	result, err := h.OpsSvc.RenewCard(service.RenewCardParams{
+		CardID:        id,
+		PlanType:      req.PlanType,
+		Months:        req.Months,
+		Price:         req.Price,
+		PaidAmount:    req.PaidAmount,
 		PaymentMethod: req.PaymentMethod,
 		TransactionNo: req.TransactionNo,
-		OperatorID:    &opID,
-		Status:        "success",
+		OperatorID:    opID,
+		StartFromNow:  req.StartFromNow,
+	})
+	if err != nil {
+		if err == service.ErrCardNotFound {
+			utils.NotFound(c, "月卡不存在")
+		} else if err == service.ErrInvalidDateRange {
+			utils.BadRequest(c, err.Error())
+		} else {
+			utils.InternalError(c, "续费失败")
+		}
+		return
 	}
-	tx.Create(&payment)
-	tx.Commit()
 
-	utils.OK(c, card)
+	utils.OK(c, result.Card)
 }
 
 func (h *MonthlyCardHandler) Check(c *gin.Context) {
@@ -371,9 +339,8 @@ func (h *MonthlyCardHandler) Check(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var card models.MonthlyCard
-	err := utils.DB.Where("parking_lot_id = ? AND vehicle_plate = ? AND status = ? AND start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE",
-		lotID, plate, "active").Order("end_date DESC").First(&card).Error
+
+	card, err := h.CardSvc.CheckVehicleActiveCard(lotID, plate)
 	if err != nil {
 		utils.OK(c, gin.H{
 			"has_card":       false,
@@ -382,11 +349,13 @@ func (h *MonthlyCardHandler) Check(c *gin.Context) {
 		})
 		return
 	}
+	validity := h.CardSvc.GetValidity(card)
 	utils.OK(c, gin.H{
 		"has_card":       true,
-		"is_active":      true,
+		"is_active":      validity.Valid,
 		"card":           card,
-		"remaining_days": int(time.Until(card.EndDate).Hours() / 24),
+		"remaining_days": validity.RemainingDays,
+		"remaining_hours": validity.RemainingHours,
 	})
 }
 
